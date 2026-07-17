@@ -1,0 +1,4 @@
+interface:
+  display_name: "知乎用户归档"
+  short_description: "采集并归档知乎用户的公开回答、文章、想法、动态与评论数据"
+  default_prompt: "Use $zhihu-user-archive to archive public content and comments from a Zhihu user."
