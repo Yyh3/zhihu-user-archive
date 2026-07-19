@@ -9,6 +9,9 @@
 - 归档回答、文章、想法、专栏、动态、提问和视频。
 - 尝试归档用户发表的评论。
 - 可选归档回答、文章和想法下的根评论与子评论。
+- 首次完整归档默认采用自适应评论策略，按需依次尝试 v5 分数排序、时间排序及旧版评论入口。
+- 使用可重建的 SQLite 状态索引保存父任务和逐页游标，支持精确断点续传。
+- 已完整归档的评论树不会在后续排序阶段重复请求子评论。
 - 支持断点续传、去重、起始偏移和限量采集。
 - 支持二次补全回答与文章正文。
 - 使用有状态 CookieJar，自动接收服务端 `Set-Cookie` 更新。
@@ -23,9 +26,16 @@ skill/zhihu-user-archive/
 ├── SKILL.md
 ├── agents/openai.yaml
 ├── references/schema.md
-└── scripts/
-    ├── archive_zhihu_user.py
-    └── browser_auth.py
+├── scripts/
+│   ├── archive_state.py
+│   ├── comment_pipeline.py
+│   ├── archive_zhihu_user.py
+│   └── browser_auth.py
+└── tests/
+    ├── test_archive_state.py
+    ├── test_comment_pipeline.py
+    ├── test_archive_integration.py
+    └── test_streaming_exports.py
 ```
 
 主程序是 `skill/zhihu-user-archive/scripts/archive_zhihu_user.py`。
@@ -159,6 +169,14 @@ Windows 将 `python3` 换成 `python`。
 --content-comments all
 ```
 
+首次完整归档默认启用自适应评论策略：
+
+```text
+--content-comments all --comment-strategy adaptive --legacy-fallback auto
+```
+
+`adaptive` 会在当前阶段达到详情页的 `comment_count` 后立即停止该父内容，避免固定遍历所有旧接口。专项核对时可使用 `exhaustive`，只抓主入口时可使用 `single-pass`。
+
 断点续传并刷新已有内容下的新评论：
 
 ```text
@@ -176,6 +194,7 @@ Windows 将 `python3` 换成 `python`。
 每次归档输出目录包含：
 
 - `records.jsonl`：无损优先的标准化记录，每行保留原始 API 对象。
+- `archive_state.sqlite3`：可由 JSONL 重建的任务、游标和轻量索引，不替代原始档案。
 - `records.csv`：适合表格软件和全文检索的扁平索引。
 - `markdown/<type>.md`：按内容类型生成的可读全文。
 - `manifest.json`：记录请求范围、数量、错误、覆盖状态和完整性判断。
@@ -196,9 +215,11 @@ Windows 将 `python3` 换成 `python`。
 3. 按服务端返回的 `paging.next` 顺序翻页，并限制跨域分页。
 4. 将不同接口对象归一化为统一字段，同时保留完整 `raw` 对象。
 5. 通过“记录类型 + 稳定 ID”去重，并把 JSONL 作为可恢复的持久层。
-6. 使用 CookieJar 接收请求过程中的 `Set-Cookie`，避免长时间归档继续使用过期会话。
-7. 当公开请求或现有会话受到认证挑战时，启动专用 Playwright 浏览器配置；用户完成可见登录或验证后，只在内存中组装请求 Cookie。
-8. 完成采集后生成 CSV、Markdown 和覆盖报告，并对照用户提供的可见数量检查缺口。
+6. 使用 SQLite 保存可重建索引、父内容状态和逐页检查点；中断后从未完成游标继续。
+7. 评论抓取按 `v5 score → v5 ts → legacy comments → legacy root comments` 自适应升级，并跳过已经齐全的子评论树。
+8. 使用 CookieJar 接收请求过程中的 `Set-Cookie`，避免长时间归档继续使用过期会话。
+9. 当公开请求或现有会话受到认证挑战时，启动专用 Playwright 浏览器配置；用户完成可见登录或验证后，只在内存中组装请求 Cookie。
+10. 完成采集后流式生成 CSV、Markdown 和覆盖报告，并对照可见数量列出评论差额。
 
 项目不会读取日常 Chrome、Edge 或 Safari 的 Cookie 数据库，也不会自动破解验证码、轮换身份、使用代理绕过限流或访问私密、已删除内容。
 
@@ -208,6 +229,13 @@ Windows 将 `python3` 换成 `python`。
 
 ```bash
 python3 skill/zhihu-user-archive/scripts/archive_zhihu_user.py --self-test
+```
+
+运行完整测试：
+
+```bash
+PYTHONPATH=skill/zhihu-user-archive/scripts \
+python3 -m unittest discover -s skill/zhihu-user-archive/tests -v
 ```
 
 自测覆盖基础采集、认证后重试、长任务重新认证、`Set-Cookie` 更新，以及 macOS 配置目录和浏览器候选路径。

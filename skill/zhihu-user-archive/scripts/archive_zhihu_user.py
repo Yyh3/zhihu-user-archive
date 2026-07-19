@@ -18,10 +18,12 @@ import os
 from pathlib import Path
 import random
 import re
+import shutil
 import sys
 import tempfile
 import threading
 import time
+from http.client import IncompleteRead
 from http.cookiejar import Cookie, CookieJar
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Iterable
@@ -268,6 +270,12 @@ def cookie_jar_from_header(cookie_header: str, base_url: str) -> CookieJar:
     return jar
 
 
+def require_safe_delay(base_url: str, delay: float) -> None:
+    hostname = (urlparse(base_url).hostname or "").lower()
+    if (hostname == "zhihu.com" or hostname.endswith(".zhihu.com")) and delay < 1.5:
+        raise ArchiveError("Real Zhihu requests require --delay of at least 1.5 seconds")
+
+
 class ApiClient:
     def __init__(
         self,
@@ -278,6 +286,7 @@ class ApiClient:
         timeout: float,
         auth_provider: Callable[[str], str] | None = None,
     ) -> None:
+        require_safe_delay(base_url, delay)
         self.base_url = base_url.rstrip("/") + "/"
         self.base_host = urlparse(self.base_url).netloc
         self.delay = max(0.0, delay)
@@ -360,7 +369,7 @@ class ApiClient:
                 if attempt >= self.retries:
                     raise ArchiveError(f"HTTP {exc.code}: {body[:300]}", exc.code) from exc
                 attempt += 1
-            except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+            except (URLError, TimeoutError, IncompleteRead, json.JSONDecodeError) as exc:
                 self.last_request = time.monotonic()
                 if attempt >= self.retries:
                     raise ArchiveError(f"Transport/JSON error: {exc}") from exc
@@ -438,6 +447,159 @@ def load_existing(path: Path) -> tuple[list[dict[str, Any]], set[tuple[str, str]
     return records, keys
 
 
+def _decode_jsonl_record(line: str, line_number: int, path: Path) -> dict[str, Any]:
+    try:
+        record = json.loads(line)
+        if not isinstance(record, dict):
+            raise TypeError("record is not an object")
+        archive_type = record["archive_type"]
+        record_id = record["id"]
+        if archive_type in (None, "") or record_id in (None, ""):
+            raise ValueError("archive_type and id must be non-empty")
+    except Exception as exc:
+        raise ArchiveError(f"Invalid JSONL {path} at line {line_number}: {exc}") from exc
+    return record
+
+
+def iter_jsonl(path: Path) -> Iterable[tuple[int, dict[str, Any]]]:
+    """Yield normalized JSONL records with their physical source line numbers."""
+    path = Path(path)
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            yield line_number, _decode_jsonl_record(line, line_number, path)
+
+
+def verify_jsonl(path: Path) -> dict[str, Any]:
+    """Inspect an archive without stopping at malformed or duplicate records."""
+    path = Path(path)
+    keys: set[tuple[str, str]] = set()
+    valid_records = 0
+    bad_lines = 0
+    duplicate_keys = 0
+    counts_by_type: dict[str, int] = {}
+    unique_counts_by_type: dict[str, int] = {}
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            try:
+                record = _decode_jsonl_record(line, line_number, path)
+            except ArchiveError:
+                bad_lines += 1
+                continue
+            archive_type = str(record["archive_type"])
+            key = (archive_type, str(record["id"]))
+            valid_records += 1
+            counts_by_type[archive_type] = counts_by_type.get(archive_type, 0) + 1
+            if key in keys:
+                duplicate_keys += 1
+            else:
+                keys.add(key)
+                unique_counts_by_type[archive_type] = unique_counts_by_type.get(archive_type, 0) + 1
+    return {
+        "valid_records": valid_records,
+        "bad_lines": bad_lines,
+        "duplicate_keys": duplicate_keys,
+        "counts_by_type": counts_by_type,
+        "unique_counts_by_type": unique_counts_by_type,
+    }
+
+
+def repair_jsonl_tail(path: Path) -> bool:
+    """Back up and remove one interrupted, non-newline-terminated JSONL tail."""
+    path = Path(path)
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        end = handle.tell()
+        handle.seek(end - 1)
+        if handle.read(1) == b"\n":
+            return False
+        position = end
+        last_newline = -1
+        while position > 0 and last_newline < 0:
+            size = min(8192, position)
+            position -= size
+            handle.seek(position)
+            block = handle.read(size)
+            found = block.rfind(b"\n")
+            if found >= 0:
+                last_newline = position + found
+        tail_start = last_newline + 1
+        handle.seek(tail_start)
+        tail = handle.read()
+    try:
+        json.loads(tail.decode("utf-8"))
+        return False
+    except (UnicodeError, json.JSONDecodeError):
+        backup = path.with_name(
+            f"{path.name}.corrupt-tail-backup-{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns()}"
+        )
+        shutil.copy2(path, backup)
+        with path.open("r+b") as handle:
+            handle.truncate(tail_start)
+        return True
+
+
+class JsonlWriter:
+    """Append-only JSONL writer whose durable append precedes index commit."""
+
+    def __init__(self, path: Path, state: Any) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.state = state
+        self.handle = self.path.open("ab")
+        self.hot_keys: set[tuple[str, str]] = set()
+        self.needs_separator = self.path.stat().st_size > 0
+        if self.needs_separator:
+            with self.path.open("rb") as existing:
+                existing.seek(-1, os.SEEK_END)
+                self.needs_separator = existing.read(1) != b"\n"
+
+    def append(self, record: dict[str, Any]) -> bool:
+        archive_type = str(record["archive_type"])
+        record_id = str(record["id"])
+        key = (archive_type, record_id)
+        if key in self.hot_keys or self.state.has_record(archive_type, record_id):
+            self.hot_keys.add(key)
+            return False
+        if self.needs_separator:
+            self.handle.write(b"\n")
+            self.handle.flush()
+            self.needs_separator = False
+        offset = self.handle.tell()
+        encoded = (
+            json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        self.handle.write(encoded)
+        self.handle.flush()
+        root_id = str(record.get("root_id") or record.get("reply_comment_id") or "")
+        self.state.upsert_record(
+            archive_type,
+            record_id,
+            str(record.get("parent_type") or ""),
+            str(record.get("parent_id") or ""),
+            root_id,
+            int(record.get("child_comment_count") or 0),
+            offset,
+        )
+        self.hot_keys.add(key)
+        return True
+
+    def close(self) -> None:
+        if not self.handle.closed:
+            self.handle.close()
+
+    def __enter__(self) -> "JsonlWriter":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        self.close()
+
+
 def atomic_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -485,40 +647,117 @@ def child_comments(client: ApiClient, root: dict[str, Any], max_items: int) -> I
                 yield row
 
 
+CSV_FIELDS = [
+    "archive_type", "id", "title", "url", "text", "excerpt", "created_time", "updated_time",
+    "author_name", "author_token", "comment_count", "voteup_count", "parent_type", "parent_id",
+]
+
+
+def export_csv_stream(path: Path, records_path: Path) -> None:
+    """Regenerate CSV one JSONL record at a time and atomically publish it."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{time.time_ns()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS, extrasaction="ignore")
+            writer.writeheader()
+            seen: set[tuple[str, str]] = set()
+            for _, record in iter_jsonl(records_path):
+                key = (str(record["archive_type"]), str(record["id"]))
+                if key in seen:
+                    continue
+                seen.add(key)
+                writer.writerow(record)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _markdown_record(record: dict[str, Any]) -> str:
+    kind = str(record["archive_type"])
+    heading = record.get("title") or record.get("excerpt") or f"{kind} {record['id']}"
+    heading = re.sub(r"\s+", " ", str(heading)).strip()[:160]
+    lines = [f"## {heading}", ""]
+    meta = []
+    if record.get("url"):
+        meta.append(f"[原文]({record['url']})")
+    if record.get("created_time") != "":
+        meta.append(f"created: {record['created_time']}")
+    if record.get("parent_id"):
+        meta.append(f"parent: {record['parent_type']} {record['parent_id']}")
+    if meta:
+        lines.extend([" | ".join(meta), ""])
+    text = record.get("text") or record.get("excerpt") or ""
+    lines.extend([str(text).strip(), "", "---", ""])
+    return "\n".join(lines)
+
+
+def export_markdown_stream(directory: Path, records_path: Path) -> None:
+    """Spool Markdown bodies by type, then add count headers and publish atomically."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    spool_handles: dict[str, Any] = {}
+    spool_paths: dict[str, Path] = {}
+    counts: dict[str, int] = {}
+    seen: set[tuple[str, str]] = set()
+    try:
+        for _, record in iter_jsonl(records_path):
+            kind = str(record["archive_type"])
+            key = (kind, str(record["id"]))
+            if key in seen:
+                continue
+            seen.add(key)
+            if kind not in spool_handles:
+                handle = tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8", newline="\n", prefix=f".{kind}.", suffix=".spool",
+                    dir=directory, delete=False,
+                )
+                spool_handles[kind] = handle
+                spool_paths[kind] = Path(handle.name)
+                counts[kind] = 0
+            if counts[kind]:
+                spool_handles[kind].write("\n")
+            spool_handles[kind].write(_markdown_record(record))
+            counts[kind] += 1
+        for handle in spool_handles.values():
+            handle.close()
+        for kind, count in counts.items():
+            destination = directory / f"{kind}.md"
+            temporary = directory / f".{kind}.{time.time_ns()}.tmp"
+            try:
+                with temporary.open("w", encoding="utf-8") as target:
+                    target.write(f"# {kind} ({count})\n\n")
+                    with spool_paths[kind].open("r", encoding="utf-8") as source:
+                        shutil.copyfileobj(source, target)
+                os.replace(temporary, destination)
+            finally:
+                if temporary.exists():
+                    temporary.unlink()
+    finally:
+        for handle in spool_handles.values():
+            if not handle.closed:
+                handle.close()
+        for spool_path in spool_paths.values():
+            if spool_path.exists():
+                spool_path.unlink()
+
+
 def export_csv(path: Path, records: list[dict[str, Any]]) -> None:
-    fields = [
-        "archive_type", "id", "title", "url", "text", "excerpt", "created_time", "updated_time",
-        "author_name", "author_token", "comment_count", "voteup_count", "parent_type", "parent_id",
-    ]
+    """Compatibility helper for callers that already own a small in-memory list."""
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+        writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(records)
 
 
 def export_markdown(directory: Path, records: list[dict[str, Any]]) -> None:
-    directory.mkdir(parents=True, exist_ok=True)
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    for record in records:
-        grouped.setdefault(record["archive_type"], []).append(record)
-    for kind, rows in grouped.items():
-        lines = [f"# {kind} ({len(rows)})", ""]
-        for row in rows:
-            heading = row.get("title") or row.get("excerpt") or f"{kind} {row['id']}"
-            heading = re.sub(r"\s+", " ", str(heading)).strip()[:160]
-            lines.extend([f"## {heading}", ""])
-            meta = []
-            if row.get("url"):
-                meta.append(f"[原文]({row['url']})")
-            if row.get("created_time") != "":
-                meta.append(f"created: {row['created_time']}")
-            if row.get("parent_id"):
-                meta.append(f"parent: {row['parent_type']} {row['parent_id']}")
-            if meta:
-                lines.extend([" | ".join(meta), ""])
-            text = row.get("text") or row.get("excerpt") or ""
-            lines.extend([str(text).strip(), "", "---", ""])
-        (directory / f"{kind}.md").write_text("\n".join(lines), encoding="utf-8")
+    """Compatibility helper retaining the historical list-based interface."""
+    with tempfile.TemporaryDirectory() as tmp:
+        records_path = Path(tmp) / "records.jsonl"
+        atomic_jsonl(records_path, records)
+        export_markdown_stream(directory, records_path)
 
 
 def resolve_token(value: str) -> str:
@@ -542,12 +781,21 @@ def parse_expected_counts(value: str) -> dict[str, int]:
 
 
 def run_archive(args: argparse.Namespace) -> int:
+    from archive_state import ArchiveState
+    from comment_pipeline import AdaptiveCommentPipeline, CommentOptions
+
+    require_safe_delay(args.base_url, args.delay)
+
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     jsonl = output / "records.jsonl"
     if jsonl.exists() and not args.resume:
         raise ArchiveError(f"{jsonl} exists; use --resume or choose a new output directory")
+    repaired_tail = repair_jsonl_tail(jsonl)
+    state_path = Path(getattr(args, "state_db", None) or output / "archive_state.sqlite3").resolve()
+    state_existed = state_path.exists()
     records, keys = load_existing(jsonl) if args.resume else ([], set())
+    existing_by_key = {(record["archive_type"], str(record["id"])): record for record in records}
     cookie, auth_provider = resolve_auth(args)
     client = ApiClient(args.base_url, cookie, args.delay, args.retries, args.timeout, auth_provider)
     token = resolve_token(args.user)
@@ -557,6 +805,18 @@ def run_archive(args: argparse.Namespace) -> int:
     invalid = [x for x in requested if x not in ENDPOINTS]
     if invalid:
         raise ArchiveError(f"Unknown --types values: {', '.join(invalid)}")
+    if not args.resume and state_existed:
+        for candidate in (state_path, Path(str(state_path) + "-wal"), Path(str(state_path) + "-shm")):
+            if candidate.exists():
+                candidate.unlink()
+        state_existed = False
+    state = ArchiveState(state_path)
+    if jsonl.exists() and (args.resume or repaired_tail or not state_existed):
+        try:
+            state.rebuild_from_jsonl(jsonl)
+        except ValueError as exc:
+            state.close()
+            raise ArchiveError(str(exc)) from exc
     manifest: dict[str, Any] = {
         "version": VERSION,
         "started_at": int(time.time()),
@@ -566,97 +826,292 @@ def run_archive(args: argparse.Namespace) -> int:
         "authentication": {"mode": getattr(args, "auth_mode", "public"), "browser_fallback": auth_provider is not None},
         "expected_counts": expected_counts,
         "start_offsets": start_offsets,
+        "state_db": str(state_path),
         "categories": {},
         "complete": False,
     }
-    mode = "a" if args.resume else "w"
     collected_for_comments: list[dict[str, Any]] = []
-    with jsonl.open(mode, encoding="utf-8", newline="\n") as handle:
-        for requested_type in requested:
-            kind, endpoint, params = ENDPOINTS[requested_type]
-            params = dict(params)
-            if requested_type in start_offsets:
-                params["offset"] = start_offsets[requested_type]
-            category = {"status": "complete", "fetched": 0, "added": 0, "error": ""}
-            manifest["categories"][requested_type] = category
-            try:
-                for raw in iter_pages(client, endpoint.format(token=token), params, args.max_items_per_type):
-                    category["fetched"] += 1
-                    record = normalize(kind, raw)
-                    if add_record(record, records, keys, handle):
-                        category["added"] += 1
-                    if kind in COMMENT_ENDPOINTS:
-                        collected_for_comments.append(record)
-                if args.max_items_per_type and category["fetched"] >= args.max_items_per_type:
-                    category["status"] = "partial"
-                    category["coverage_warning"] = "Capped by --max-items-per-type."
-                if requested_type == "activities" and category["fetched"] == 0:
-                    category["status"] = "partial"
-                    category["coverage_warning"] = "A zero-row activity feed does not prove there is no historical activity."
-                if requested_type == "comments-authored":
-                    category["coverage_warning"] = "Zero results do not prove the user authored no comments."
-                    category["status"] = "partial"
-            except ArchiveError as exc:
-                if category["fetched"]:
-                    category["status"] = "partial"
-                else:
-                    category["status"] = "unavailable" if exc.unavailable else "failed"
-                category["error"] = str(exc)
-                category["http_status"] = exc.status
-            atomic_json(output / "manifest.json", manifest)
-
-        if args.content_comments == "all":
-            category = {
-                "status": "complete", "fetched": 0, "added": 0, "parents_attempted": 0,
-                "parents_skipped_existing": 0, "parents_refreshed_existing": 0,
-                "parents_skipped_zero": 0, "errors": [],
-            }
-            manifest["categories"]["content-comments"] = category
-            existing_comment_parents = {
-                (str(record.get("parent_type") or ""), str(record.get("parent_id") or ""))
-                for record in records if record.get("archive_type") == "comment_received"
-            }
-            for parent in collected_for_comments:
-                ptype = parent["archive_type"]
-                endpoints = COMMENT_ENDPOINTS.get(ptype)
-                if not endpoints:
-                    continue
-                parent_key = (str(ptype), str(parent["id"]))
-                if args.resume and parent_key in existing_comment_parents and not args.refresh_existing_comments:
-                    category["parents_skipped_existing"] += 1
-                    continue
-                if args.resume and parent_key in existing_comment_parents:
-                    category["parents_refreshed_existing"] += 1
-                if parent.get("comment_count") in {0, "0"}:
-                    category["parents_skipped_zero"] += 1
-                    continue
-                category["parents_attempted"] += 1
+    try:
+        with JsonlWriter(jsonl, state) as writer:
+            for requested_type in requested:
+                kind, endpoint, params = ENDPOINTS[requested_type]
+                params = dict(params)
+                if requested_type in start_offsets:
+                    params["offset"] = start_offsets[requested_type]
+                category = {"status": "complete", "fetched": 0, "added": 0, "error": ""}
+                manifest["categories"][requested_type] = category
                 try:
-                    paths = tuple(endpoint.format(id=parent["id"]) for endpoint in endpoints)
-                    params = {"order_by": "score", "offset": ""}
-                    for raw in iter_pages_fallback(client, paths, params, args.max_comments_per_parent):
+                    for raw in iter_pages(client, endpoint.format(token=token), params, args.max_items_per_type):
                         category["fetched"] += 1
-                        root = normalize("comment_received", raw, ptype, parent["id"])
-                        if add_record(root, records, keys, handle):
+                        record = normalize(kind, raw)
+                        fresh_parent = record
+                        record_key = (record["archive_type"], str(record["id"]))
+                        if writer.append(record):
                             category["added"] += 1
-                        for child in child_comments(client, raw, args.max_comments_per_parent):
-                            category["fetched"] += 1
-                            child_record = normalize("comment_received", child, ptype, parent["id"])
-                            if add_record(child_record, records, keys, handle):
-                                category["added"] += 1
+                            records.append(record)
+                            keys.add(record_key)
+                            existing_by_key[record_key] = record
+                        else:
+                            record = existing_by_key.get(record_key, record)
+                        if kind in COMMENT_ENDPOINTS:
+                            collected_for_comments.append(fresh_parent)
+                    if args.max_items_per_type and category["fetched"] >= args.max_items_per_type:
+                        category["status"] = "partial"
+                        category["coverage_warning"] = "Capped by --max-items-per-type."
+                    if requested_type == "activities" and category["fetched"] == 0:
+                        category["status"] = "partial"
+                        category["coverage_warning"] = "A zero-row activity feed does not prove there is no historical activity."
+                    if requested_type == "comments-authored":
+                        category["coverage_warning"] = "Zero results do not prove the user authored no comments."
+                        category["status"] = "partial"
                 except ArchiveError as exc:
-                    category["status"] = "partial"
-                    category["errors"].append({"parent_type": ptype, "parent_id": parent["id"], "error": str(exc)})
+                    if exc.status == 429:
+                        category["status"] = "partial" if category["fetched"] else "failed"
+                        category["error"] = str(exc)
+                        category["http_status"] = exc.status
+                        atomic_json(output / "manifest.json", manifest)
+                        raise
+                    if category["fetched"]:
+                        category["status"] = "partial"
+                    else:
+                        category["status"] = "unavailable" if exc.unavailable else "failed"
+                    category["error"] = str(exc)
+                    category["http_status"] = exc.status
                 atomic_json(output / "manifest.json", manifest)
 
-    export_csv(output / "records.csv", records)
-    export_markdown(output / "markdown", records)
+            if args.content_comments == "all":
+                category = {
+                    "status": "complete", "fetched": 0, "added": 0, "parents_attempted": 0,
+                    "parents_skipped_existing": 0, "parents_refreshed_existing": 0,
+                    "parents_resumed_partial": 0,
+                    "parents_skipped_zero": 0, "errors": [],
+                    "progress": {
+                        "current_stage": "", "page_count": 0,
+                        "roots_skipped_known": 0, "records_added": 0,
+                    },
+                    "performance": {
+                        "pages_requested": 0,
+                        "records_returned": 0,
+                        "records_added": 0,
+                        "roots_seen": 0,
+                        "roots_skipped_known": 0,
+                        "child_trees_skipped_complete": 0,
+                        "child_tree_traversals": 0,
+                        "child_pages_requested": 0,
+                        "parents_completed_by_count": 0,
+                        "parents_partial_after_all_stages": 0,
+                        "endpoint_http_status_counts": {},
+                        "elapsed_seconds_by_stage": {},
+                        "mismatch_count": 0,
+                        "missing_sum": 0,
+                        "top_mismatches": [],
+                    },
+                }
+                manifest["categories"]["content-comments"] = category
+                existing_comment_parents = {
+                    (str(record.get("parent_type") or ""), str(record.get("parent_id") or ""))
+                    for record in records if record.get("archive_type") == "comment_received"
+                }
+                unique_parents: dict[tuple[str, str], dict[str, Any]] = {}
+                for parent in collected_for_comments:
+                    ptype = parent["archive_type"]
+                    if ptype not in COMMENT_ENDPOINTS:
+                        continue
+                    parent_key = (str(ptype), str(parent["id"]))
+                    if parent_key in unique_parents:
+                        category["parents_skipped_duplicate"] = category.get("parents_skipped_duplicate", 0) + 1
+                        continue
+                    unique_parents[parent_key] = parent
+                parents = sorted(
+                    unique_parents.values(),
+                    key=lambda parent: (int(parent.get("comment_count") or 0), str(parent.get("id") or "")),
+                )
+                strategy = getattr(args, "comment_strategy", "adaptive")
+                common_options = dict(
+                    legacy_fallback=getattr(args, "legacy_fallback", "auto"),
+                    legacy_root_threshold=getattr(args, "legacy_root_threshold", 1),
+                    max_comments_per_parent=args.max_comments_per_parent,
+                    checkpoint_every_page=getattr(args, "checkpoint_every_page", True),
+                )
+
+                def write_comment(record: dict[str, Any]) -> bool:
+                    added = writer.append(record)
+                    if added:
+                        records.append(record)
+                        key = (str(record["archive_type"]), str(record["id"]))
+                        keys.add(key)
+                        existing_by_key[key] = record
+                    return added
+
+                performance = category["performance"]
+                numeric_metrics = (
+                    "pages_requested", "records_returned", "records_added", "roots_seen",
+                    "roots_skipped_known", "child_trees_skipped_complete", "child_tree_traversals",
+                    "child_pages_requested",
+                )
+
+                def add_metrics(parent: dict[str, Any], result: dict[str, Any], final: bool) -> None:
+                    ptype = str(parent["archive_type"])
+                    for metric in numeric_metrics:
+                        performance[metric] += int(result.get(metric, 0))
+                    for status, count in result.get("endpoint_http_status_counts", {}).items():
+                        performance["endpoint_http_status_counts"][status] = (
+                            performance["endpoint_http_status_counts"].get(status, 0) + count
+                        )
+                    for stage, elapsed in result.get("elapsed_seconds_by_stage", {}).items():
+                        performance["elapsed_seconds_by_stage"][stage] = round(
+                            performance["elapsed_seconds_by_stage"].get(stage, 0.0) + float(elapsed), 6
+                        )
+                    if final:
+                        expected = int(result.get("expected", 0))
+                        archived = int(result.get("archived", 0))
+                        if result.get("status") == "complete" and archived == expected:
+                            performance["parents_completed_by_count"] += 1
+                        else:
+                            performance["parents_partial_after_all_stages"] += 1
+                            category["status"] = "partial"
+                        if archived != expected:
+                            category["status"] = "partial"
+                            performance["mismatch_count"] += 1
+                            missing = max(0, expected - archived)
+                            performance["missing_sum"] += missing
+                            performance["top_mismatches"].append({
+                                "parent_type": ptype,
+                                "parent_id": str(parent["id"]),
+                                "expected": expected,
+                                "archived": archived,
+                                "missing": missing,
+                                "stage": str(result.get("stage") or ""),
+                                "status": str(result.get("status") or ""),
+                                "title": str(parent.get("title") or ""),
+                            })
+                            performance["top_mismatches"].sort(
+                                key=lambda item: (
+                                    -int(item["missing"]),
+                                    item["parent_type"],
+                                    item["parent_id"],
+                                )
+                            )
+                            del performance["top_mismatches"][50:]
+                    category["fetched"] = performance["records_returned"]
+                    category["added"] = performance["records_added"]
+                    category["progress"] = {
+                        "current_stage": str(result.get("stage") or ""),
+                        "page_count": performance["pages_requested"],
+                        "roots_skipped_known": performance["roots_skipped_known"],
+                        "records_added": performance["records_added"],
+                    }
+                    if result.get("errors"):
+                        error_entry = {
+                            "parent_type": ptype, "parent_id": parent["id"],
+                            "errors": list(result["errors"]),
+                            "error": str(result["errors"][0]),
+                        }
+                        status_counts = result.get("endpoint_http_status_counts", {})
+                        if len(status_counts) == 1:
+                            status_value = next(iter(status_counts))
+                            if str(status_value).isdigit():
+                                error_entry["http_status"] = int(status_value)
+                        category["errors"].append(error_entry)
+
+                def add_failed_parent(
+                    parent: dict[str, Any], exc: ArchiveError
+                ) -> None:
+                    category["status"] = "partial"
+                    manifest["complete"] = False
+                    failed_metrics = getattr(exc, "comment_metrics", None)
+                    if isinstance(failed_metrics, dict):
+                        add_metrics(parent, failed_metrics, True)
+                        return
+                    performance["parents_partial_after_all_stages"] += 1
+                    error_entry = {
+                        "parent_type": str(parent["archive_type"]),
+                        "parent_id": parent["id"],
+                        "error": str(exc),
+                    }
+                    if exc.status is not None:
+                        error_entry["http_status"] = exc.status
+                    category["errors"].append(error_entry)
+
+                eligible: list[dict[str, Any]] = []
+                for parent in parents:
+                    ptype = str(parent["archive_type"])
+                    parent_key = (ptype, str(parent["id"]))
+                    expected = int(parent.get("comment_count") or 0)
+                    archived = state.archived_parent_count(ptype, str(parent["id"]))
+                    task = state.load_parent_task(ptype, str(parent["id"]))
+                    confirmed_complete = bool(
+                        task is not None and task.status == "complete" and archived == expected
+                    )
+                    if args.resume and confirmed_complete and not args.refresh_existing_comments:
+                        category["parents_skipped_existing"] += 1
+                        continue
+                    if args.resume and parent_key in existing_comment_parents and args.refresh_existing_comments:
+                        category["parents_refreshed_existing"] += 1
+                    elif args.resume and archived:
+                        category["parents_resumed_partial"] += 1
+                    if parent.get("comment_count") in {0, "0"}:
+                        category["parents_skipped_zero"] += 1
+                        continue
+                    category["parents_attempted"] += 1
+                    eligible.append(parent)
+
+                first_pipeline = AdaptiveCommentPipeline(
+                    client, state, write_comment, CommentOptions(strategy="single-pass", **common_options),
+                    normalize_func=normalize, error_type=ArchiveError,
+                )
+                later: list[dict[str, Any]] = []
+                for parent in eligible:
+                    ptype = str(parent["archive_type"])
+                    try:
+                        result = first_pipeline.run_parent(parent)
+                        final = strategy == "single-pass" or (
+                            strategy == "adaptive" and result.get("status") in {"complete", "capped"}
+                        )
+                        add_metrics(parent, result, final)
+                        if not final:
+                            later.append(parent)
+                    except ArchiveError as exc:
+                        add_failed_parent(parent, exc)
+                        if exc.status == 429:
+                            atomic_json(output / "manifest.json", manifest)
+                            raise
+                    atomic_json(output / "manifest.json", manifest)
+
+                later.sort(
+                    key=lambda parent: (
+                        -(int(parent.get("comment_count") or 0) - state.archived_parent_count(
+                            str(parent["archive_type"]), str(parent["id"])
+                        )),
+                        str(parent["id"]),
+                    )
+                )
+                if later:
+                    later_pipeline = AdaptiveCommentPipeline(
+                        client, state, write_comment, CommentOptions(strategy=strategy, **common_options),
+                        normalize_func=normalize, error_type=ArchiveError,
+                    )
+                    for parent in later:
+                        ptype = str(parent["archive_type"])
+                        try:
+                            result = later_pipeline.run_parent(parent)
+                            add_metrics(parent, result, True)
+                        except ArchiveError as exc:
+                            add_failed_parent(parent, exc)
+                            if exc.status == 429:
+                                atomic_json(output / "manifest.json", manifest)
+                                raise
+                        atomic_json(output / "manifest.json", manifest)
+    finally:
+        state.close()
+
+    verification = verify_jsonl(jsonl)
+    export_csv_stream(output / "records.csv", jsonl)
+    export_markdown_stream(output / "markdown", jsonl)
     manifest["finished_at"] = int(time.time())
-    manifest["total_unique_records"] = len(records)
-    manifest["counts_by_type"] = {}
-    for record in records:
-        kind = record["archive_type"]
-        manifest["counts_by_type"][kind] = manifest["counts_by_type"].get(kind, 0) + 1
+    manifest["counts_by_type"] = verification["unique_counts_by_type"]
+    manifest["total_unique_records"] = sum(manifest["counts_by_type"].values())
+    manifest["record_verification"] = verification
     for requested_type, expected in expected_counts.items():
         if requested_type not in manifest["categories"]:
             continue
@@ -670,7 +1125,10 @@ def run_archive(args: argparse.Namespace) -> int:
             category["coverage_warning"] = f"Visible count is {expected}, but archive contains {actual} unique records."
     manifest["complete"] = all(c.get("status") == "complete" for c in manifest["categories"].values())
     atomic_json(output / "manifest.json", manifest)
-    print(json.dumps({"output": str(output), "records": len(records), "complete": manifest["complete"]}, ensure_ascii=False))
+    print(json.dumps({
+        "output": str(output), "records": manifest["total_unique_records"],
+        "complete": manifest["complete"], "record_verification": verification,
+    }, ensure_ascii=False))
     return 0 if manifest["complete"] else 2
 
 
@@ -789,29 +1247,56 @@ def self_test() -> int:
 
 def rebuild_exports(output_value: str) -> int:
     output = Path(output_value).resolve()
-    records, _ = load_existing(output / "records.jsonl")
-    export_csv(output / "records.csv", records)
-    export_markdown(output / "markdown", records)
+    records_path = output / "records.jsonl"
+    verification = verify_jsonl(records_path)
+    export_csv_stream(output / "records.csv", records_path)
+    export_markdown_stream(output / "markdown", records_path)
     manifest_path = output / "manifest.json"
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     else:
         manifest = {"version": VERSION, "categories": {}}
-    counts: dict[str, int] = {}
-    for record in records:
-        kind = str(record["archive_type"])
-        counts[kind] = counts.get(kind, 0) + 1
+    counts = verification["unique_counts_by_type"]
     manifest["finished_at"] = int(time.time())
-    manifest["total_unique_records"] = len(records)
+    manifest["total_unique_records"] = sum(counts.values())
     manifest["counts_by_type"] = counts
+    manifest["record_verification"] = verification
     manifest["complete"] = False
     manifest["coverage_warning"] = "Exports rebuilt after an interrupted incremental run; review category gaps before claiming completeness."
     atomic_json(manifest_path, manifest)
-    print(json.dumps({"output": str(output), "records": len(records), "rebuilt": True}, ensure_ascii=False))
+    print(json.dumps({
+        "output": str(output), "records": manifest["total_unique_records"], "rebuilt": True,
+        "record_verification": verification,
+    }, ensure_ascii=False))
+    return 0
+
+
+def rebuild_state_index(output_value: str, state_db_value: str | None = None) -> int:
+    from archive_state import ArchiveState
+
+    output = Path(output_value).resolve()
+    jsonl = output / "records.jsonl"
+    if not jsonl.exists():
+        raise ArchiveError(f"Missing {jsonl}")
+    repair_jsonl_tail(jsonl)
+    state_path = Path(state_db_value or output / "archive_state.sqlite3").resolve()
+    state = ArchiveState(state_path)
+    try:
+        try:
+            count = state.rebuild_from_jsonl(jsonl)
+        except ValueError as exc:
+            raise ArchiveError(str(exc)) from exc
+    finally:
+        state.close()
+    print(json.dumps({
+        "output": str(output), "state_db": str(state_path), "rebuilt_record_count": count,
+    }, ensure_ascii=False))
     return 0
 
 
 def enrich_details(args: argparse.Namespace) -> int:
+    require_safe_delay(args.base_url, args.delay)
+    require_safe_delay(ARTICLE_DETAIL_BASE_URL, args.delay)
     output = Path(args.output).resolve()
     jsonl_path = output / "records.jsonl"
     records, _ = load_existing(jsonl_path)
@@ -863,7 +1348,7 @@ def enrich_details(args: argparse.Namespace) -> int:
                 if kind == "answer":
                     raw = answer_client.get(
                         f"answers/{original['id']}",
-                        {"include": "content,excerpt,question,author,created_time,updated_time"},
+                        {"include": "content,excerpt,question,author,created_time,updated_time,comment_count"},
                     )
                 else:
                     raw = article_client.get(f"articles/{original['id']}")
@@ -888,8 +1373,9 @@ def enrich_details(args: argparse.Namespace) -> int:
 
     merged = [detail_map.get((str(r["archive_type"]), str(r["id"])), r) for r in records]
     atomic_jsonl(jsonl_path, merged)
-    export_csv(output / "records.csv", merged)
-    export_markdown(output / "markdown", merged)
+    verification = verify_jsonl(jsonl_path)
+    export_csv_stream(output / "records.csv", jsonl_path)
+    export_markdown_stream(output / "markdown", jsonl_path)
     progress["finished_at"] = int(time.time())
     progress["enriched_total"] = sum(
         1 for r in merged
@@ -897,12 +1383,9 @@ def enrich_details(args: argparse.Namespace) -> int:
     )
     progress["status"] = "complete" if not progress["errors"] and progress["fetched"] + progress["skipped_existing"] == len(targets) else "partial"
     manifest["detail_enrichment"] = progress
-    counts: dict[str, int] = {}
-    for record in merged:
-        kind = str(record["archive_type"])
-        counts[kind] = counts.get(kind, 0) + 1
-    manifest["total_unique_records"] = len(merged)
-    manifest["counts_by_type"] = counts
+    manifest["counts_by_type"] = verification["unique_counts_by_type"]
+    manifest["total_unique_records"] = sum(manifest["counts_by_type"].values())
+    manifest["record_verification"] = verification
     manifest["complete"] = False
     atomic_json(manifest_path, manifest)
     if sidecar.exists():
@@ -917,6 +1400,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", help="Output directory")
     parser.add_argument("--types", default=DEFAULT_TYPES, help=f"Comma-separated categories (default: {DEFAULT_TYPES})")
     parser.add_argument("--content-comments", choices=["none", "all"], default="none")
+    parser.add_argument("--comment-strategy", choices=["adaptive", "single-pass", "exhaustive"], default="adaptive")
+    parser.add_argument("--checkpoint-every-page", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--state-db", help="State database path; defaults to <output>/archive_state.sqlite3")
+    parser.add_argument("--legacy-fallback", choices=["auto", "always", "never"], default="auto")
+    parser.add_argument("--legacy-root-threshold", type=int, default=1)
+    parser.add_argument("--rebuild-state-index", action="store_true")
     parser.add_argument(
         "--auth-mode", choices=["auto", "public", "cookie", "browser"], default="auto",
         help="auto tries public/cookie auth then opens a dedicated browser after an auth challenge",
@@ -950,6 +1439,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    if args.legacy_root_threshold < 0:
+        parser.error("--legacy-root-threshold must be >= 0")
     if args.login_browser and args.logout_browser:
         parser.error("choose only one of --login-browser and --logout-browser")
     try:
@@ -964,6 +1455,10 @@ def main() -> int:
             return 0
         if args.self_test:
             return self_test()
+        if args.rebuild_state_index:
+            if not args.output:
+                parser.error("--output is required with --rebuild-state-index")
+            return rebuild_state_index(args.output, args.state_db)
         if args.rebuild_exports:
             if not args.output:
                 parser.error("--output is required with --rebuild-exports")
